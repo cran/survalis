@@ -94,32 +94,25 @@ compute_calibration <- function(model, data, time, status,
   df <- data.frame(pred_surv = pred_surv, time = time, status = status, bin = bins)
 
   # calibration table
-  calibration_table <- df |>
-    group_by(bin) |>
-    summarise(
+  calibration_table <- data.table::as.data.table(df)[, {
+    surv_fit <- survfit(Surv(time, status) ~ 1, data = .SD)
+    surv_summary <- summary(surv_fit, times = eval_time, extend = TRUE)
+    list(
       mean_pred_surv = mean(pred_surv, na.rm = TRUE),
-      observed_surv = {
-        surv_fit <- survfit(Surv(time, status) ~ 1, data = pick(everything()))
-        surv_summary <- summary(surv_fit, times = eval_time, extend = TRUE)
-        if (length(surv_summary$surv) == 0) NA else surv_summary$surv
-      },
-      .groups = "drop"
+      observed_surv = if (length(surv_summary$surv) == 0) NA else surv_summary$surv
     )
+  }, keyby = bin]
 
   # bootstrap CIs
   boot_results <- replicate(n_boot, {
     idx <- sample(seq_len(nrow(df)), replace = TRUE)
-    df_boot <- df[idx, ]
-    df_boot |>
-      group_by(bin) |>
-      summarise(
-        observed_surv = {
-          surv_fit <- survfit(Surv(time, status) ~ 1, data = pick(everything()))
-          surv_summary <- summary(surv_fit, times = eval_time, extend = TRUE)
-          if (length(surv_summary$surv) == 0) NA else surv_summary$surv
-        }, .groups = "drop"
-      ) |>
-      pull(observed_surv)
+    df_boot <- data.table::as.data.table(df[idx, ])
+    out <- df_boot[, {
+      surv_fit <- survfit(Surv(time, status) ~ 1, data = .SD)
+      surv_summary <- summary(surv_fit, times = eval_time, extend = TRUE)
+      list(observed_surv = if (length(surv_summary$surv) == 0) NA else surv_summary$surv)
+    }, keyby = bin]
+    out$observed_surv
   }, simplify = "matrix")
 
   boot_ci <- apply(boot_results, 1, function(x) quantile(x, probs = c(0.025, 0.975), na.rm = TRUE))
@@ -143,6 +136,9 @@ compute_calibration <- function(model, data, time, status,
 #' @param calib_output Output list returned by [compute_calibration()].
 #' @param smooth Logical; if `TRUE`, overlays a LOESS smooth of
 #'   `observed_surv ~ mean_pred_surv`.
+#' @param title Plot title. If missing, an automatically generated title is
+#'   used. Pass `NULL` to omit the title entirely (e.g., for journals
+#'   requiring caption-only figures).
 #'
 #' @return A `ggplot2` object showing bin-wise calibration points, bootstrap
 #' error bars, the 45° reference line, and (optionally) a smooth curve.
@@ -168,11 +164,12 @@ compute_calibration <- function(model, data, time, status,
 #' @seealso [compute_calibration()]
 #' @export
 
-plot_calibration <- function(calib_output, smooth = TRUE) {
+plot_calibration <- function(calib_output, smooth = TRUE, title) {
   ct <- calib_output$calibration_table
   etime <- calib_output$eval_time
   nboot <- calib_output$n_boot
   nbins <- calib_output$n_bins
+  if (missing(title)) title <- paste0("Calibration at t = ", etime, " | ", calib_output$learner)
 
   p <- ggplot(ct, aes(x = mean_pred_surv, y = observed_surv)) +
     geom_point(size = 2) +
@@ -181,14 +178,13 @@ plot_calibration <- function(calib_output, smooth = TRUE) {
     coord_fixed(ratio = 1, xlim = c(0, 1), ylim = c(0, 1)) +
     labs(
       x = "Mean Predicted Survival",
-      y = "Observed Survival",
-      title = paste0("Calibration at t = ", etime, " | ", calib_output$learner)#,
-      #subtitle = paste0("n_bins = ", nbins, ", Bootstrap = ", nboot, " resamples")
+      y = "Observed Survival"
     ) +
-    theme_minimal()
+    theme_survalis()
+  if (!is.null(title)) p <- p + labs(title = title)
 
   if (smooth) {
-    p <- p + geom_smooth(method = "loess", se = FALSE, color = "blue", formula = y ~ x)
+    p <- p + geom_smooth(method = "loess", se = FALSE, color = .survalis_palette[1], formula = y ~ x)
   }
 
   return(p)

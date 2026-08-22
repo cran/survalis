@@ -4,10 +4,14 @@
 \alias{cv_plot}
 \title{Boxplot of Cross-Validation Metric Distributions}
 \usage{
-cv_plot(cv_results)
+cv_plot(cv_results, title)
 }
 \arguments{
 \item{cv_results}{A tibble/data frame as returned by \code{cv_survlearner()}.}
+
+\item{title}{Plot title. If missing, an automatically generated title is
+used. Pass \code{NULL} to omit the title entirely (e.g., for journals
+requiring caption-only figures).}
 }
 \value{
 A \pkg{ggplot2} object.
@@ -17,7 +21,7 @@ Visualizes per-fold metric values from \code{\link{cv_survlearner}} using a
 boxplot with jittered points.
 }
 \examples{
-cv_results <- tibble::tibble(
+cv_results <- data.frame(
   metric = c("cindex", "cindex", "ibs", "ibs"),
   value = c(0.62, 0.66, 0.19, 0.21)
 )

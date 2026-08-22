@@ -1,4 +1,95 @@
 
+#' Benchmark Survival Learners (Meta Function)
+#'
+#' The single entry point for comparing multiple survival learners. With
+#' \code{tune = FALSE} (default), each learner is run with fixed
+#' hyperparameters via \code{\link{benchmark_default_survlearners}}. With
+#' \code{tune = TRUE}, each learner is tuned internally per outer fold via
+#' nested cross-validation using \code{\link{benchmark_tuned_survlearners}}.
+#'
+#' @param formula A survival formula of the form \code{Surv(time, status) ~ x1 + x2 + ...}.
+#' @param data A data frame containing the variables in \code{formula}.
+#' @param learners Character vector of learner ids (without prefixes), e.g.
+#'   \code{c("ranger", "coxph", "glmnet")}.
+#' @param times Numeric vector of evaluation time points for survival predictions.
+#' @param metrics Character vector of metrics to compute/optimize.
+#' @param tune Logical; if \code{FALSE} (default), benchmarks learners with
+#'   fixed hyperparameters (\code{folds}, \code{ncores} apply). If \code{TRUE},
+#'   tunes each learner via nested CV (\code{outer_folds}, \code{inner_folds},
+#'   \code{inner_ncores}, \code{learner_args}, \code{refit_final} apply).
+#' @param folds Integer number of CV folds; used only when \code{tune = FALSE}.
+#' @param outer_folds,inner_folds Integer numbers of outer/inner CV folds; used
+#'   only when \code{tune = TRUE}.
+#' @param seed Integer random seed.
+#' @param ncores Integer CPU cores for fold-level mapping; used only when
+#'   \code{tune = FALSE}.
+#' @param inner_ncores Integer CPU cores for each learner's inner tuning CV;
+#'   used only when \code{tune = TRUE}.
+#' @param learner_args Optional named list of learner-specific tuning
+#'   arguments; used only when \code{tune = TRUE}. See
+#'   \code{\link{benchmark_tuned_survlearners}}.
+#' @param refit_final Logical; if \code{TRUE} (and \code{tune = TRUE}), tunes
+#'   and refits each learner on the full dataset in addition to the outer CV.
+#' @param verbose Logical; print progress.
+#' @param suppress_errors Logical; if \code{TRUE} (default), per-learner
+#'   errors are caught and reported via \code{warning()} instead of stopping
+#'   the whole benchmark.
+#' @param ... Additional arguments forwarded to \code{benchmark_default_survlearners()}
+#'   (fit arguments) when \code{tune = FALSE}, or to \code{benchmark_tuned_survlearners()}
+#'   (common tuning arguments) when \code{tune = TRUE}.
+#'
+#' @return With \code{tune = FALSE}, a data frame of CV results (see
+#'   \code{\link{benchmark_default_survlearners}}). With \code{tune = TRUE}, a
+#'   list of class \code{"nested_surv_benchmark"} (see
+#'   \code{\link{benchmark_tuned_survlearners}}).
+#'
+#' @examples
+#' \donttest{
+#' res <- benchmark(
+#'   Surv(time, status) ~ age + karno + trt,
+#'   data = veteran,
+#'   learners = c("coxph", "rpart"),
+#'   times = c(80, 160),
+#'   metrics = c("cindex", "ibs"),
+#'   folds = 2,
+#'   seed = 1
+#' )
+#' head(res)
+#' }
+#'
+#' @seealso [benchmark_default_survlearners()], [benchmark_tuned_survlearners()]
+#' @export
+benchmark <- function(formula, data, learners, times,
+                      metrics = c("cindex", "ibs"),
+                      tune = FALSE,
+                      folds = 5,
+                      outer_folds = 5,
+                      inner_folds = 5,
+                      seed = 123,
+                      ncores = 1,
+                      inner_ncores = 1,
+                      learner_args = list(),
+                      refit_final = FALSE,
+                      verbose = FALSE,
+                      suppress_errors = TRUE,
+                      ...) {
+  if (isTRUE(tune)) {
+    benchmark_tuned_survlearners(
+      formula = formula, data = data, learners = learners, times = times,
+      metrics = metrics, outer_folds = outer_folds, inner_folds = inner_folds,
+      seed = seed, inner_ncores = inner_ncores, learner_args = learner_args,
+      refit_final = refit_final, verbose = verbose,
+      suppress_errors = suppress_errors, ...
+    )
+  } else {
+    benchmark_default_survlearners(
+      formula = formula, data = data, learners = learners, times = times,
+      metrics = metrics, folds = folds, seed = seed, ncores = ncores,
+      verbose = verbose, suppress_errors = suppress_errors, ...
+    )
+  }
+}
+
 #' Benchmark Multiple Survival Learners (Cross-Validation Wrapper)
 #'
 #' Runs \code{cv_survlearner()} for a set of learner names (e.g., \code{"ranger"},
@@ -106,7 +197,7 @@ benchmark_default_survlearners <- function(formula, data, learners, times,
   })
 
   # combine results
-  results_combined <- dplyr::bind_rows(results_list)
+  results_combined <- data.table::rbindlist(results_list, fill = TRUE)
   if (nrow(results_combined) == 0) {
     stop("All learners failed or returned empty results.")
   }
@@ -123,7 +214,7 @@ benchmark_default_survlearners <- function(formula, data, learners, times,
 
   all_vars <- all.vars(formula)
   n_before <- nrow(data)
-  data <- tidyr::drop_na(data, dplyr::all_of(all_vars))
+  data <- .complete_cases_df(data, all_vars)
   n_after <- nrow(data)
 
   if (verbose && n_after < n_before) {
@@ -152,26 +243,7 @@ benchmark_default_survlearners <- function(formula, data, learners, times,
 
   surv_obj <- survival::Surv(time = data[[time_col]], event = status_vector)
 
-  tibble::tibble(metric = metrics) |>
-    dplyr::mutate(value = lapply(metric, function(metric) {
-      switch(metric,
-        "cindex" = cindex_survmat(surv_obj, predicted = pred, t_star = max(times)),
-        "auc" = auc_survmat(surv_obj, predicted = pred, t_star = max(times)),
-        "brier" = {
-          if (length(times) != 1) stop("Brier requires a single time point.")
-          brier(surv_obj, pre_sp = pred[, 1], t_star = times)
-        },
-        "ibs" = ibs_survmat(surv_obj, sp_matrix = pred, times = times),
-        "iae" = iae_survmat(surv_obj, sp_matrix = pred, times = times),
-        "ise" = ise_survmat(surv_obj, sp_matrix = pred, times = times),
-        "ece" = {
-          if (length(times) != 1) stop("ECE requires a single time point.")
-          ece_survmat(surv_obj, sp_matrix = pred, t_star = times)
-        },
-        stop("Unknown metric: ", metric)
-      )
-    })) |>
-    tidyr::unnest(cols = value)
+  .score_metrics(surv_obj, pred, times, metrics)
 }
 
 
@@ -211,11 +283,7 @@ benchmark_default_survlearners <- function(formula, data, learners, times,
     stop("All tuning configurations failed or returned NA for the primary metric.")
   }
 
-  if (.nested_surv_higher_is_better(primary_metric)) {
-    dplyr::arrange(tuning_results, dplyr::desc(.data[[primary_metric]]))
-  } else {
-    dplyr::arrange(tuning_results, .data[[primary_metric]])
-  }
+  .arrange_by_metric_dt(tuning_results, primary_metric, .nested_surv_higher_is_better(primary_metric))
 }
 
 
@@ -443,7 +511,7 @@ benchmark_tuned_survlearners <- function(formula, data, learners, times,
           tune_args = tune_args
         )
 
-        best_param_df <- tuning_results[1, .nested_surv_param_cols(tuning_results), drop = FALSE]
+        best_param_df <- .select_cols(tuning_results[1, ], .nested_surv_param_cols(tuning_results))
         fit_args <- c(
           list(formula = formula, data = train),
           .nested_surv_row_to_list(best_param_df),
@@ -460,21 +528,13 @@ benchmark_tuned_survlearners <- function(formula, data, learners, times,
           pred = pred,
           times = times,
           metrics = metrics
-        ) |>
-          dplyr::mutate(
-            learner = learner,
-            id = fold_id,
-            outer_fold = i
-          ) |>
-          dplyr::relocate(learner, id, outer_fold)
+        )
+        scores[, `:=`(learner = learner, id = fold_id, outer_fold = i)]
+        data.table::setcolorder(scores, c("learner", "id", "outer_fold"))
 
-        params <- tibble::as_tibble(best_param_df) |>
-          dplyr::mutate(
-            learner = learner,
-            id = fold_id,
-            outer_fold = i
-          ) |>
-          dplyr::relocate(learner, id, outer_fold)
+        params <- data.table::as.data.table(best_param_df)
+        params[, `:=`(learner = learner, id = fold_id, outer_fold = i)]
+        data.table::setcolorder(params, c("learner", "id", "outer_fold"))
 
         list(scores = scores, params = params)
       }, error = function(e) {
@@ -492,8 +552,8 @@ benchmark_tuned_survlearners <- function(formula, data, learners, times,
       }
     }
 
-    outer_results[[learner]] <- dplyr::bind_rows(learner_results)
-    selected_params[[learner]] <- dplyr::bind_rows(learner_params)
+    outer_results[[learner]] <- data.table::rbindlist(learner_results, fill = TRUE)
+    selected_params[[learner]] <- data.table::rbindlist(learner_params, fill = TRUE)
 
     if (isTRUE(refit_final)) {
       final_model <- tryCatch({
@@ -509,7 +569,7 @@ benchmark_tuned_survlearners <- function(formula, data, learners, times,
           tune_args = tune_args
         )
 
-        final_param_df <- final_tuning[1, .nested_surv_param_cols(final_tuning), drop = FALSE]
+        final_param_df <- .select_cols(final_tuning[1, ], .nested_surv_param_cols(final_tuning))
         fit_args <- c(
           list(formula = formula, data = data),
           .nested_surv_row_to_list(final_param_df),
@@ -532,8 +592,8 @@ benchmark_tuned_survlearners <- function(formula, data, learners, times,
     }
   }
 
-  outer_results <- dplyr::bind_rows(outer_results)
-  selected_params <- dplyr::bind_rows(selected_params)
+  outer_results <- data.table::rbindlist(outer_results, fill = TRUE)
+  selected_params <- data.table::rbindlist(selected_params, fill = TRUE)
 
   if (nrow(outer_results) == 0L) {
     stop("All learners failed or returned empty nested CV results.")
@@ -570,12 +630,14 @@ benchmark_tuned_survlearners <- function(formula, data, learners, times,
 #' @param benchmark_results A data frame produced by
 #'   \code{benchmark_default_survlearners()}, containing at least
 #'   \code{learner}, \code{metric}, and \code{value}.
+#' @param digits Integer number of decimal places for \code{mean}, \code{sd},
+#'   \code{se}, \code{lower}, \code{upper} (default \code{3}).
 #'
-#' @return A tibble with columns \code{learner}, \code{metric}, \code{mean},
+#' @return A data.table with columns \code{learner}, \code{metric}, \code{mean},
 #' \code{sd}, \code{n}, \code{se}, \code{lower}, \code{upper}.
 #'
 #' @examples
-#' res <- tibble::tibble(
+#' res <- data.frame(
 #'   learner = c("coxph", "coxph", "rpart", "rpart"),
 #'   metric = c("cindex", "ibs", "cindex", "ibs"),
 #'   value = c(0.64, 0.19, 0.60, 0.23)
@@ -586,18 +648,19 @@ benchmark_tuned_survlearners <- function(formula, data, learners, times,
 #'   [summarize_benchmark_results()]
 #' @export
 
-summarise_benchmark <- function(benchmark_results) {
-  benchmark_results |>
-    dplyr::group_by(learner, metric) |>
-    dplyr::summarise(
-      mean = mean(value, na.rm = TRUE),
-      sd   = sd(value, na.rm = TRUE),
-      n    = dplyr::n(),
-      se   = sd / sqrt(n),
-      lower = mean - 1.96 * se,
-      upper = mean + 1.96 * se,
-      .groups = "drop"
-    )
+summarise_benchmark <- function(benchmark_results, digits = 3) {
+  DT <- data.table::as.data.table(benchmark_results)
+  out <- DT[, list(
+    mean = mean(value, na.rm = TRUE),
+    sd   = stats::sd(value, na.rm = TRUE),
+    n    = .N
+  ), by = list(learner, metric)]
+  out[, se := sd / sqrt(n)]
+  out[, lower := mean - 1.96 * se]
+  out[, upper := mean + 1.96 * se]
+  out[, c("mean", "sd", "se", "lower", "upper") :=
+    lapply(.SD, round, digits = digits), .SDcols = c("mean", "sd", "se", "lower", "upper")]
+  out[]
 }
 
 
@@ -610,11 +673,14 @@ summarise_benchmark <- function(benchmark_results) {
 #' @param benchmark_results A data frame from
 #'   \code{benchmark_default_survlearners()} with columns \code{learner},
 #'   \code{metric}, and \code{value}.
+#' @param title Plot title. If missing, an automatically generated title is
+#'   used. Pass \code{NULL} to omit the title entirely (e.g., for journals
+#'   requiring caption-only figures).
 #'
 #' @return A \pkg{ggplot2} object.
 #'
 #' @examples
-#' res <- tibble::tibble(
+#' res <- data.frame(
 #'   learner = c("coxph", "coxph", "rpart", "rpart"),
 #'   metric = c("cindex", "ibs", "cindex", "ibs"),
 #'   value = c(0.64, 0.19, 0.60, 0.23)
@@ -624,17 +690,19 @@ summarise_benchmark <- function(benchmark_results) {
 #' @seealso [benchmark_default_survlearners()], [summarise_benchmark()]
 #' @export
 
-plot_benchmark <- function(benchmark_results) {
-  ggplot(benchmark_results, ggplot2::aes(x = learner, y = value)) +
-    geom_boxplot(fill = "lightblue", alpha = 0.4, outlier.shape = NA) +
+plot_benchmark <- function(benchmark_results, title) {
+  if (missing(title)) title <- "Cross-Validated Performance of Survival Learners"
+  p <- ggplot(benchmark_results, ggplot2::aes(x = learner, y = value)) +
+    geom_boxplot(fill = .survalis_palette[1], alpha = 0.4, outlier.shape = NA) +
     geom_jitter(width = 0.1, size = 2, alpha = 0.6) +
     facet_wrap(~ metric, scales = "free_y") +
     labs(
-      title = "Cross-Validated Performance of Survival Learners",
       x = "Learner",
       y = "Metric Value"
     ) +
-    ggplot2::theme_minimal(base_size = 14)
+    theme_survalis()
+  if (!is.null(title)) p <- p + labs(title = title)
+  p
 }
 
 
@@ -653,7 +721,7 @@ plot_benchmark <- function(benchmark_results) {
 #'   containing formatted strings \code{"mean  sd"}.
 #'
 #' @examples
-#' res <- tibble::tibble(
+#' res <- data.frame(
 #'   learner = c("coxph", "coxph", "rpart", "rpart"),
 #'   metric = c("cindex", "ibs", "cindex", "ibs"),
 #'   value = c(0.64, 0.19, 0.60, 0.23)
@@ -667,22 +735,16 @@ summarize_benchmark_results <- function(results, digits = 3) {
 
   stopifnot(is.data.frame(results), all(c("learner", "metric", "value") %in% colnames(results)))
 
-  results |>
-    dplyr::group_by(learner, metric) |>
-    dplyr::summarise(
-      mean = mean(value, na.rm = TRUE),
-      sd   = sd(value, na.rm = TRUE),
-      .groups = "drop"
-    ) |>
-    dplyr::mutate(
-      summary = sprintf("%.*f  %.*f", digits, mean, digits, sd)
-    ) |>
-    tidyr::pivot_wider(
-      id_cols = learner,
-      names_from = metric,
-      values_from = summary
-    ) |>
-    dplyr::arrange(learner)
+  DT <- data.table::as.data.table(results)
+  summarised <- DT[, list(
+    mean = mean(value, na.rm = TRUE),
+    sd   = stats::sd(value, na.rm = TRUE)
+  ), by = list(learner, metric)]
+  summarised[, summary := sprintf("%.*f  %.*f", digits, mean, digits, sd)]
+
+  out <- data.table::dcast(summarised, learner ~ metric, value.var = "summary")
+  data.table::setorderv(out, "learner")
+  out[]
 }
 
 
@@ -707,7 +769,7 @@ summarize_benchmark_results <- function(results, digits = 3) {
 #'   average \code{value} for the best learner(s). Ties are returned as multiple rows.
 #'
 #' @examples
-#' res <- tibble::tibble(
+#' res <- data.frame(
 #'   learner = c("coxph", "coxph", "rpart", "rpart"),
 #'   metric = c("cindex", "ibs", "cindex", "ibs"),
 #'   value = c(0.64, 0.19, 0.60, 0.23)
@@ -728,13 +790,11 @@ best_survlearner <- function(benchmark_results, metric, maximize = NULL) {
     maximize <- !(metric %in% c("ibs", "brier", "iae", "ise", "ece"))
   }
 
-  summary <- benchmark_results |>
-    dplyr::filter(metric == !!metric) |>
-    dplyr::group_by(learner, metric) |>
-    dplyr::summarise(value = mean(value, na.rm = TRUE), .groups = "drop")
+  target_metric <- metric
+  DT <- data.table::as.data.table(benchmark_results)
+  summary <- DT[metric == target_metric, list(value = mean(value, na.rm = TRUE)), by = list(learner, metric)]
 
-  best <- summary |>
-    dplyr::filter(if (maximize) value == max(value) else value == min(value))
+  best <- if (maximize) summary[value == max(value)] else summary[value == min(value)]
 
-  return(best)
+  return(best[])
   }

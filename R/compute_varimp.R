@@ -12,12 +12,18 @@
 #' @param subset Optional row indices or logical vector to subset \code{model$data}.
 #' @param importance_type One of \code{"delta"} (default) or \code{"mean"}; see Details.
 #'
-#' @return A data.frame with columns:
+#' @return A data.table with columns:
 #' \itemize{
 #'   \item \code{feature}: feature name,
-#'   \item \code{value}: importance value (change in metric),
+#'   \item \code{importance}: importance value (change in metric),
+#'   \item \code{importance_05}, \code{importance_95}: 5th/95th percentile of the
+#'     per-repetition values used to compute \code{importance},
 #'   \item \code{scaled_importance}: percent-scaled importance (see Details).
 #' }
+#' The full per-repetition values (one row per feature per repetition, columns
+#' \code{feature}, \code{repetition}, \code{value}, \code{scaled_value}) are attached
+#' as the \code{"raw_scores"} attribute, used by \code{\link{plot_varimp}()} to draw
+#' boxplots instead of a single point per feature.
 #'
 #' @details
 #' For each feature, rows are permuted \code{n_repetitions} times, predictions are recomputed,
@@ -82,61 +88,75 @@ compute_varimp <- function(model, times,
     status_vector <- data[[status_col]]
   }
 
-  # Compute baseline loss
+  # Compute baseline loss (single metric requested, so a single row/value)
   model$data <- data  # ensure correct data
-  original_loss <- score_survmodel(model, times = times, metrics = metric) |>
-    dplyr::filter(metric == !!metric) |>
-    dplyr::pull(value)
+  original_loss <- score_survmodel(model, times = times, metrics = metric)$value
 
   exclude_vars <- c(time_col, status_col)
   covariates <- setdiff(names(data), exclude_vars)
   if (!is.null(seed)) set.seed(seed)
 
-  results <- purrr::map(covariates, function(v) {
+  per_feature <- lapply(covariates, function(v) {
     scores <- replicate(n_repetitions, {
       data_perm <- data
       data_perm[[v]] <- sample(data_perm[[v]])
       model$data <- data_perm  # inject permuted data
-      score_survmodel(model, times = times, metrics = metric) |>
-        dplyr::filter(metric == !!metric) |>
-        dplyr::pull(value)
+      score_survmodel(model, times = times, metrics = metric)$value
     })
+
+    # values used for the point estimate are the same used for the 5/95
+    # percentile band and for the raw per-repetition boxplot data, so the
+    # displayed uncertainty is always about the quantity actually plotted
+    values <- if (importance_type == "delta") scores - original_loss else scores
 
     imp <- switch(importance_type,
                   "mean" = mean(scores),
-                  "delta" = mean(scores - original_loss)
+                  "delta" = mean(values)
     )
 
-    imp_05 <- quantile(scores, 0.05)
-    imp_95 <- quantile(scores, 0.95)
-
-    tibble::tibble(
-      feature = v,
-      importance = imp,
-      importance_05 = imp_05,
-      importance_95 = imp_95
+    list(
+      summary = data.table::data.table(
+        feature = v,
+        importance = imp,
+        importance_05 = stats::quantile(values, 0.05),
+        importance_95 = stats::quantile(values, 0.95)
+      ),
+      raw = data.table::data.table(feature = v, repetition = seq_len(n_repetitions), value = values)
     )
   })
 
-  result <- dplyr::bind_rows(results)
+  result <- data.table::rbindlist(lapply(per_feature, `[[`, "summary"))
+  raw_scores <- data.table::rbindlist(lapply(per_feature, `[[`, "raw"))
 
   result$scaled_importance <- switch(importance_type,
                                      "mean"  = 100 * (result$importance - original_loss) / original_loss,
                                      "delta" = 100 * abs(result$importance) / max(abs(result$importance), na.rm = TRUE)
   )
+  raw_scores$scaled_value <- switch(importance_type,
+                                    "mean"  = 100 * (raw_scores$value - original_loss) / original_loss,
+                                    "delta" = 100 * abs(raw_scores$value) / max(abs(result$importance), na.rm = TRUE)
+  )
 
-  dplyr::arrange(result, dplyr::desc(scaled_importance))
+  result <- .arrange_by_metric_dt(result, "scaled_importance", maximize = TRUE)
+  attr(result, "raw_scores") <- raw_scores
+  result
 }
 
 
 #' Plot Permutation Variable Importance
 #'
-#' Creates a dot plot of permutation-based variable importance, using either the
-#' scaled importance (default) or the raw importance column.
+#' Plots the distribution of per-repetition permutation importance values as a
+#' boxplot per feature, using either the scaled importance (default) or the raw
+#' importance column. Falls back to a single point per feature (with no
+#' distribution shown) for \code{varimp_df} objects that lack the
+#' \code{"raw_scores"} attribute (e.g., hand-built summary tables).
 #'
 #' @param varimp_df A data frame as returned by \code{\link{compute_varimp}}.
 #' @param use_scaled Logical; if \code{TRUE} (default), plot \code{scaled_importance}
 #'   (percent). If unavailable, falls back to raw \code{importance} with a warning.
+#' @param title Plot title. If missing, an automatically generated title is
+#'   used. Pass \code{NULL} to omit the title entirely (e.g., for journals
+#'   requiring caption-only figures).
 #'
 #' @return A \pkg{ggplot2} object.
 #'
@@ -154,27 +174,38 @@ compute_varimp <- function(model, times,
 #' plot_varimp(imp, use_scaled = FALSE)
 #' @export
 
-plot_varimp <- function(varimp_df, use_scaled = TRUE) {
+plot_varimp <- function(varimp_df, use_scaled = TRUE, title) {
   if (use_scaled && (!"scaled_importance" %in% names(varimp_df) || all(is.na(varimp_df$scaled_importance)))) {
     warning("Scaled importance not available. Falling back to raw importance.")
     use_scaled <- FALSE
   }
+  if (missing(title)) title <- "Permutation-based variable importance"
 
   aes_x <- if (use_scaled) "scaled_importance" else "importance"
+  feature_levels <- varimp_df$feature[order(varimp_df[[aes_x]])]
+  xlab <- if (use_scaled) "Scaled importance (%)" else "Raw importance"
 
-  p <- ggplot2::ggplot(varimp_df, ggplot2::aes(y = reorder(feature, !!sym(aes_x)), x = !!sym(aes_x))) +
-    ggplot2::geom_point(size = 3)
+  raw <- attr(varimp_df, "raw_scores")
 
-  if (!use_scaled && all(c("importance_05", "importance_95") %in% names(varimp_df))) {
-    # Removed as per your request: don't include error bars when using raw importance
-    # p <- p + ggplot2::geom_errorbar(ggplot2::aes(xmin = importance_05, xmax = importance_95), width = 0.3)
+  if (!is.null(raw)) {
+    plot_df <- data.table::copy(raw)
+    plot_df$feature <- factor(plot_df$feature, levels = feature_levels)
+    value_col <- if (use_scaled) "scaled_value" else "value"
+
+    p <- ggplot2::ggplot(plot_df, ggplot2::aes(y = feature, x = .data[[value_col]])) +
+        ggplot2::geom_vline(xintercept = 0, linetype = "dashed", color = "gray40") +
+        ggplot2::geom_boxplot(fill = .survalis_palette[1], alpha = 0.6, outlier.alpha = 0.4) +
+        ggplot2::labs(y = NULL, x = xlab) +
+        theme_survalis()
+    if (!is.null(title)) p <- p + ggplot2::labs(title = title)
+    return(p)
   }
 
-  p +
-    ggplot2::labs(
-      y = NULL,
-      x = if (use_scaled) "Scaled importance (%)" else "Raw importance",
-      title = "Permutation-based variable importance"
-    ) +
-    ggplot2::theme_minimal()
+  p <- ggplot2::ggplot(varimp_df, ggplot2::aes(y = reorder(feature, !!sym(aes_x)), x = !!sym(aes_x))) +
+    ggplot2::geom_vline(xintercept = 0, linetype = "dashed", color = "gray40") +
+    ggplot2::geom_point(size = 3, color = .survalis_palette[1]) +
+    ggplot2::labs(y = NULL, x = xlab) +
+    theme_survalis()
+  if (!is.null(title)) p <- p + ggplot2::labs(title = title)
+  p
 }

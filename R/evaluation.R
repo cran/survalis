@@ -78,9 +78,11 @@ cindex_survmat <- function(object, predicted, t_star = NULL) {
 #'
 #' Computes a cumulative/dynamic time-dependent AUC using predicted survival
 #' probabilities at a specified time point (or the last column if \code{t_star}
-#' is \code{NULL}). Cases are subjects with an observed event by \code{t_star};
-#' controls are subjects known to survive beyond \code{t_star}. Subjects
-#' censored before \code{t_star} are handled through IPCW weighting.
+#' is \code{NULL}), following the Uno et al. (2007) / Heagerty and Zheng (2005)
+#' estimator as implemented in the \pkg{timeROC} package. Cases are subjects
+#' with an observed event strictly before \code{t_star}; controls are subjects
+#' known to survive beyond \code{t_star}. Subjects censored before \code{t_star}
+#' are handled through IPCW weighting.
 #'
 #' @param object A \code{\link[survival]{Surv}} object of length \eqn{n}.
 #' @param predicted An \code{n x k} matrix or data frame of survival probabilities
@@ -127,7 +129,7 @@ auc_survmat <- function(object, predicted, t_star = NULL) {
   }
 
   risk_score <- 1 - surv_prob
-  cases <- which(time <= t_star & status == 1)
+  cases <- which(time < t_star & status == 1)
   controls <- which(time > t_star)
 
   if (!length(cases) || !length(controls)) {
@@ -162,6 +164,54 @@ auc_survmat <- function(object, predicted, t_star = NULL) {
 
   names(auc_value) <- "auc"
   round(auc_value, 6)
+}
+
+#' Time-Dependent ROC/AUC Curve from a Survival-Probability Matrix
+#'
+#' Computes the cumulative/dynamic time-dependent AUC (Uno et al., 2007;
+#' Heagerty and Zheng, 2005) at each time in \code{times}, using marginal
+#' (Kaplan-Meier) inverse-probability-of-censoring weighting for cases. This
+#' is a thin vectorized wrapper around \code{\link{auc_survmat}} that returns
+#' a full \eqn{AUC(t)} curve instead of a single time point, matching the
+#' quantity reported by \code{timeROC::timeROC()} with
+#' \code{weighting = "marginal"}.
+#'
+#' @param object A \code{\link[survival]{Surv}} object of length \eqn{n}.
+#' @param predicted An \code{n x k} matrix or data frame of survival probabilities
+#'   with columns named \code{"t=<time>"}, one column per entry of \code{times}.
+#' @param times Numeric vector of evaluation time points; each must have a
+#'   matching \code{"t=<time>"} column in \code{predicted}.
+#'
+#' @return A \code{data.frame} (class \code{"timeroc_survmat"}) with columns
+#'   \code{time} and \code{auc}, one row per entry of \code{times}.
+#'
+#' @seealso [auc_survmat()]
+#'
+#' @references
+#' Uno H, Cai T, Tian L, Wei LJ (2007). Evaluating prediction rules for
+#' t-year survivors with censored regression models. \doi{10.1198/016214507000000149}
+#'
+#' Heagerty PJ, Zheng Y (2005). Survival model predictive accuracy and ROC
+#' curves. \doi{10.1111/j.0006-341X.2005.030814.x}
+#'
+#' @examples
+#' y <- survival::Surv(time = veteran$time, event = veteran$status)
+#' times <- c(30, 90, 180)
+#' sp <- sapply(times, function(t) stats::plogis(-scale(veteran$karno) + log(t) / 5))
+#' colnames(sp) <- paste0("t=", times)
+#' timeroc_survmat(y, predicted = sp, times = times)
+#' @export
+timeroc_survmat <- function(object, predicted, times) {
+  if (!inherits(object, "Surv")) stop("object must be a survival object (from Surv())")
+  if (!length(times)) stop("times must be a non-empty numeric vector.")
+
+  auc_vals <- vapply(times, function(t_star) {
+    unname(auc_survmat(object, predicted = predicted, t_star = t_star))
+  }, numeric(1))
+
+  out <- data.frame(time = times, auc = auc_vals)
+  class(out) <- c("timeroc_survmat", class(out))
+  out
 }
 
 #' Brier Score with IPCW for a Single Time Point
@@ -487,6 +537,29 @@ names(ece) <- "ece"
 round(ece, 6)
 }
 
+.score_metrics <- function(surv_obj, pred, times, metrics, digits = 3) {
+  values <- vapply(metrics, function(m) {
+    unname(switch(m,
+      "cindex" = cindex_survmat(surv_obj, predicted = pred, t_star = max(times)),
+      "auc"    = auc_survmat(surv_obj, predicted = pred, t_star = max(times)),
+      "brier"  = {
+        if (length(times) != 1) stop("Brier requires a single time point.")
+        brier(surv_obj, pre_sp = pred[, 1], t_star = times)
+      },
+      "ibs" = ibs_survmat(surv_obj, sp_matrix = pred, times = times),
+      "iae" = iae_survmat(surv_obj, sp_matrix = pred, times = times),
+      "ise" = ise_survmat(surv_obj, sp_matrix = pred, times = times),
+      "ece" = {
+        if (length(times) != 1) stop("ECE requires a single time point.")
+        ece_survmat(surv_obj, sp_matrix = pred, t_star = times)
+      },
+      stop("Unknown metric: ", m)
+    ))
+  }, numeric(1))
+
+  data.table::data.table(metric = metrics, value = round(values, digits))
+}
+
 
 
 #' Cross-Validate a Survival Learner (fold-mapped with \code{fmapn})
@@ -526,9 +599,9 @@ round(ece, 6)
 #'
 #' Fold iteration is performed via \code{functionals::fmapn()}, which preserves
 #' per-fold identifiers (\code{id}, \code{fold}) and returns a list ready for
-#' \code{dplyr::bind_rows()}.
+#' \code{data.table::rbindlist()}.
 #'
-#' @return A tibble with columns: \code{splits} (rsample split object),
+#' @return A \code{data.table} with columns: \code{splits} (rsample split object),
 #'   \code{id}, \code{fold}, \code{metric}, and \code{value}.
 #'
 #' @examples
@@ -549,8 +622,6 @@ round(ece, 6)
 #' @importFrom functionals fmapn
 #' @keywords survival cross-validation fmapn parallel
 #' @export
-
-
 
 cv_survlearner <- function(formula, data,
   fit_fun, pred_fun,
@@ -575,7 +646,9 @@ recode_status <- parsed_formula$recode_status
 
 all_vars <- all.vars(formula)
 n_before <- nrow(data)
-data <- tidyr::drop_na(data, dplyr::all_of(all_vars))
+DT <- data.table::as.data.table(data)
+DT <- DT[stats::complete.cases(DT[, all_vars, with = FALSE])]
+data <- as.data.frame(DT)
 n_after <- nrow(data)
 
 if (verbose && n_after < n_before) {
@@ -613,28 +686,15 @@ status_vector <- test[[status_col]]
 
 surv_obj <- survival::Surv(time = test[[time_col]], event = status_vector)
 
-tibble::tibble(metric = metrics) |>
-      dplyr::mutate(value = lapply(metric, function(metric) {
-        switch(metric,
-          "cindex" = cindex_survmat(surv_obj, predicted = pred, t_star = max(times)),
-          "auc" = auc_survmat(surv_obj, predicted = pred, t_star = max(times)),
-          "brier"  = {
-            if (length(times) != 1) stop("Brier requires a single time point.")
-            brier(surv_obj, pre_sp = pred[, 1], t_star = times)
-          },
-      "ibs" = ibs_survmat(surv_obj, sp_matrix = pred, times = times),
-      "iae" = iae_survmat(surv_obj, sp_matrix = pred, times = times),
-      "ise" = ise_survmat(surv_obj, sp_matrix = pred, times = times),
-      "ece" = {
-        if (length(times) != 1) stop("ECE requires a single time point.")
-        ece_survmat(surv_obj, sp_matrix = pred, t_star = times)
-      },
-      stop("Unknown metric: ", metric)
-    )
-  })) |> tidyr::unnest(cols = value) |>
-  dplyr::mutate(splits = list(split), id = id, fold = fold) |>
-  dplyr::relocate(splits, id, fold)}, ncores = ncores, pb = pb)
-  dplyr::bind_rows(results)
+scored <- .score_metrics(surv_obj, pred, times, metrics)
+data.table::data.table(
+  splits = replicate(nrow(scored), split, simplify = FALSE),
+  id = id,
+  fold = fold,
+  metric = scored$metric,
+  value = scored$value
+)}, ncores = ncores, pb = pb)
+  data.table::rbindlist(results)
 }
 
 
@@ -645,30 +705,33 @@ tibble::tibble(metric = metrics) |>
 #' for each metric returned by \code{\link{cv_survlearner}}.
 #'
 #' @param cv_results A tibble/data frame as returned by \code{cv_survlearner()}.
+#' @param digits Integer number of decimal places for \code{mean}, \code{sd},
+#'   \code{se}, \code{lower}, \code{upper} (default \code{3}).
 #'
-#' @return A tibble with columns: \code{metric}, \code{mean}, \code{sd}, \code{n},
+#' @return A data.table with columns: \code{metric}, \code{mean}, \code{sd}, \code{n},
 #'   \code{se}, \code{lower}, \code{upper}.
 #'
 #' @examples
-#' cv_results <- tibble::tibble(
+#' cv_results <- data.frame(
 #'   metric = c("cindex", "cindex", "ibs", "ibs"),
 #'   value = c(0.62, 0.66, 0.19, 0.21)
 #' )
 #' cv_summary(cv_results)
 #' @export
 
-cv_summary <- function(cv_results) {
-  cv_results |>
-    group_by(metric) |>
-    summarise(
-      mean = mean(value, na.rm = TRUE),
-      sd   = sd(value, na.rm = TRUE),
-      n    = dplyr::n(),
-      se   = sd/sqrt(n),
-      lower = (mean - 1.96 * se),
-      upper = (mean + 1.96 * se),
-      .groups = "drop"
-    )
+cv_summary <- function(cv_results, digits = 3) {
+  DT <- data.table::as.data.table(cv_results)
+  out <- DT[, list(
+    mean = mean(value, na.rm = TRUE),
+    sd   = stats::sd(value, na.rm = TRUE),
+    n    = .N
+  ), by = metric]
+  out[, se := sd / sqrt(n)]
+  out[, lower := mean - 1.96 * se]
+  out[, upper := mean + 1.96 * se]
+  out[, c("mean", "sd", "se", "lower", "upper") :=
+    lapply(.SD, round, digits = digits), .SDcols = c("mean", "sd", "se", "lower", "upper")]
+  out[]
 }
 
 
@@ -678,23 +741,29 @@ cv_summary <- function(cv_results) {
 #' boxplot with jittered points.
 #'
 #' @param cv_results A tibble/data frame as returned by \code{cv_survlearner()}.
+#' @param title Plot title. If missing, an automatically generated title is
+#'   used. Pass \code{NULL} to omit the title entirely (e.g., for journals
+#'   requiring caption-only figures).
 #'
 #' @return A \pkg{ggplot2} object.
 #'
 #' @examples
-#' cv_results <- tibble::tibble(
+#' cv_results <- data.frame(
 #'   metric = c("cindex", "cindex", "ibs", "ibs"),
 #'   value = c(0.62, 0.66, 0.19, 0.21)
 #' )
 #' cv_plot(cv_results)
 #' @export
 
-cv_plot <- function(cv_results) {
-  ggplot(cv_results, aes(x = metric, y = value)) +
-    geom_boxplot(fill = "skyblue", outlier.shape = NA, alpha = 0.3) +
+cv_plot <- function(cv_results, title) {
+  if (missing(title)) title <- "Cross-Validation Performance"
+  p <- ggplot(cv_results, aes(x = metric, y = value)) +
+    geom_boxplot(fill = .survalis_palette[1], outlier.shape = NA, alpha = 0.3) +
     geom_jitter(width = 0.15, alpha = 0.5) +
-    labs(title = "Cross-Validation Performance", x = "Metric", y = "Value") +
-    theme_minimal()
+    labs(x = "Metric", y = "Value") +
+    theme_survalis()
+  if (!is.null(title)) p <- p + labs(title = title)
+  p
 }
 
 
@@ -716,7 +785,7 @@ cv_plot <- function(cv_results) {
 #' builds a \code{Surv} object from \code{model$formula}, and computes the metrics.
 #' If \code{"brier"} is requested with multiple \code{times}, an error is thrown.
 #'
-#' @return A tibble with columns \code{metric} and \code{value}.
+#' @return A data.table with columns \code{metric} and \code{value}.
 #'
 #' @examples
 #' fitted_model <- fit_coxph(Surv(time, status) ~ age + karno + trt, data = veteran)
@@ -774,19 +843,5 @@ score_survmodel <- function(model, times, metrics = c("cindex", "ibs", "brier", 
   surv_obj <- survival::Surv(time = data[[time_col]], event = status_vector)
 
   # score each metric
-  tibble::tibble(metric = metrics) |>
-    dplyr::mutate(value = purrr::map(metric, function(metric) {
-      switch(metric,
-        "cindex" = cindex_survmat(surv_obj, predicted = sp_matrix, t_star = max(times)),
-        "auc"    = auc_survmat(surv_obj, predicted = sp_matrix, t_star = max(times)),
-        "brier"  = brier(surv_obj, pre_sp = sp_matrix[, 1], t_star = times),
-        "ibs"    = ibs_survmat(surv_obj, sp_matrix, times),
-        "iae"    = iae_survmat(surv_obj, sp_matrix, times),
-        "ise"    = ise_survmat(surv_obj, sp_matrix, times),
-        "ece"    = ece_survmat(surv_obj, sp_matrix = sp_matrix, t_star = times),
-        stop("Unknown metric: ", metric)
-      )      
-    })) |>
-
-    tidyr::unnest(cols = value)
-  }
+  .score_metrics(surv_obj, sp_matrix, times, metrics)
+}

@@ -1,7 +1,7 @@
 Package: survalis
 Type: Package
 Title: Interpretable Survival Machine Learning Framework
-Version: 0.7.1
+Version: 1.0.0
 Author: Imad El Badisy [aut, cre]
 Maintainer: Imad El Badisy <elbadisyimad@gmail.com>
 Authors@R: 
@@ -27,21 +27,21 @@ Description: A modular toolkit for interpretable survival machine learning
   and other related methods for survival modeling, prediction, and
   interpretation.
 License: MIT + file LICENSE
-URL: https://github.com/ielbadisy/survalis
+URL: https://CRAN.R-project.org/package=survalis
 BugReports: https://github.com/ielbadisy/survalis/issues
 Encoding: UTF-8
 LazyData: true
 Depends: R (>= 4.1)
-Imports: survival, ggplot2, functionals, nnls, rpart, tibble, rsample,
-        aftgee, aorsf, bnnSurvival, pec, party, ranger, survdnn,
-        survivalsvm, randomForestSRC, xgboost, BART, flexsurv, glmnet,
+Imports: survival, ggplot2, functionals, nnls, rpart, rsample, aftgee,
+        aorsf, bnnSurvival, pec, party, ranger, survdnn, survivalsvm,
+        randomForestSRC, xgboost, CoxBoost, BART, flexsurv, glmnet,
         mboost, rstpm2, timereg, partykit, gower, pracma, torch,
-        data.table, dplyr, glue, cli, purrr, rlang, tidyr
+        data.table, glue, cli, rlang
 Suggests: testthat (>= 3.0.0), knitr, rmarkdown, roxygen2, covr, stats,
-        utils
+        utils, timeROC, patchwork
 RoxygenNote: 7.3.3
 Config/testthat/edition: 3
 NeedsCompilation: no
-Packaged: 2026-04-22 14:58:58 UTC; imad-el-badisy
+Packaged: 2026-08-22 10:20:09 UTC; imad-el-badisy
 Repository: CRAN
-Date/Publication: 2026-04-23 20:20:02 UTC
+Date/Publication: 2026-08-22 15:10:08 UTC
